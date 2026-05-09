@@ -1,0 +1,9 @@
+import { Module, Global } from '@nestjs/common';
+import { BullmqService } from './bullmq.service';
+
+@Global()
+@Module({
+  providers: [BullmqService],
+  exports: [BullmqService],
+})
+export class BullmqModule {}

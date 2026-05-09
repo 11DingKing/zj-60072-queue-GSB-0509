@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: zj-60072-postgres
+    environment:
+      POSTGRES_DB: db_zj_60072
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev123456
+    ports:
+      - "15072:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - zj-60072-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d db_zj_60072"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: zj-60072-redis
+    ports:
+      - "16372:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - zj-60072-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  zj-60072-network:
+    driver: bridge

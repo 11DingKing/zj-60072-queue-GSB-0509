@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  WAITING
+  ACTIVE
+  COMPLETED
+  FAILED
+  DELAYED
+}
+
+model Queue {
+  id            String    @id @default(cuid())
+  name          String    @unique
+  description   String?
+  isPaused      Boolean   @default(false)
+  concurrency   Int       @default(1)
+  maxRetries    Int       @default(3)
+  retryDelay    Int       @default(1000)
+  timeout       Int       @default(30000)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  jobs          Job[]
+  scheduledJobs ScheduledJob[]
+  workers       Worker[]
+  deadLetterJobs DeadLetterJob[]
+
+  @@map("queues")
+}
+
+model Job {
+  id              String     @id @default(cuid())
+  queueId         String
+  name            String
+  data            Json
+  status          JobStatus  @default(WAITING)
+  priority        Int        @default(5)
+  retryCount      Int        @default(0)
+  delay           Int?
+  parentJobId     String?
+  isDependency    Boolean    @default(false)
+  bullmqJobId     String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  completedAt     DateTime?
+  failedAt        DateTime?
+
+  queue           Queue      @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  parentJob       Job?       @relation("JobDependencies", fields: [parentJobId], references: [id], onDelete: SetNull)
+  childJobs       Job[]      @relation("JobDependencies")
+  logs            JobLog[]
+  scheduledJob    ScheduledJob? @relation("ScheduledJobToJob")
+
+  @@index([queueId])
+  @@index([status])
+  @@index([priority])
+  @@map("jobs")
+}
+
+model ScheduledJob {
+  id            String    @id @default(cuid())
+  queueId       String
+  name          String
+  data          Json
+  cron          String?
+  delay         Int?
+  isRecurring   Boolean   @default(false)
+  nextRunAt     DateTime?
+  lastRunAt     DateTime?
+  bullmqJobId   String?
+  isActive      Boolean   @default(true)
+  jobId         String?   @unique
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  queue         Queue     @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  job           Job?      @relation("ScheduledJobToJob", fields: [jobId], references: [id], onDelete: SetNull)
+
+  @@index([queueId])
+  @@index([jobId])
+  @@map("scheduled_jobs")
+}
+
+model Worker {
+  id            String    @id @default(cuid())
+  queueId       String
+  name          String
+  processorName String    @default("default")
+  status        String    @default("idle")
+  processingRate Float    @default(0)
+  lastHeartbeat DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  queue         Queue     @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@index([queueId])
+  @@map("workers")
+}
+
+model JobLog {
+  id            String    @id @default(cuid())
+  jobId         String
+  status        JobStatus
+  message       String?
+  error         String?
+  retryCount    Int       @default(0)
+  startTime     DateTime?
+  endTime       DateTime?
+  duration      Int?
+  createdAt     DateTime  @default(now())
+
+  job           Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@map("job_logs")
+}
+
+model DeadLetterJob {
+  id            String    @id @default(cuid())
+  queueId       String
+  originalJobId String
+  name          String
+  data          Json
+  errorMessage  String?
+  failedCount   Int       @default(0)
+  movedAt       DateTime  @default(now())
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  action        String?
+  createdAt     DateTime  @default(now())
+
+  queue         Queue     @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@index([queueId])
+  @@map("dead_letter_jobs")
+}
