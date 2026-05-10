@@ -9,6 +9,7 @@ import { WorkerModule } from './worker/worker.module';
 import { MonitorModule } from './monitor/monitor.module';
 import { DeadLetterModule } from './dead-letter/dead-letter.module';
 import { JobLogModule } from './job-log/job-log.module';
+import { RetryPolicyModule } from './retry-policy/retry-policy.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { JobLogModule } from './job-log/job-log.module';
     MonitorModule,
     DeadLetterModule,
     JobLogModule,
+    RetryPolicyModule,
   ],
 })
 export class AppModule {}
