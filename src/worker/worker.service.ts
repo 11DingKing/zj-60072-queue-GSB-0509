@@ -3,6 +3,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { BullmqService } from '../bullmq/bullmq.service';
 import { QueueService } from '../queue/queue.service';
 import { JobService } from '../job/job.service';
+import { RetryPolicyService } from '../retry-policy/retry-policy.service';
+import { ErrorClassifier } from '../retry-policy/error-classifier';
+import { ErrorCategory } from '../config/error-classifier.config';
 import { Worker, Job as BullmqJob } from 'bullmq';
 import { Worker as WorkerModel, JobStatus } from '@prisma/client';
 
@@ -17,6 +20,8 @@ export class WorkerService {
     private bullmqService: BullmqService,
     private queueService: QueueService,
     private jobService: JobService,
+    private retryPolicyService: RetryPolicyService,
+    private errorClassifier: ErrorClassifier,
   ) {}
 
   async registerWorker(queueId: string): Promise<WorkerModel> {
@@ -63,31 +68,97 @@ export class WorkerService {
         console.log(`[Worker ${workerName}] Job completed: ${bullmqJob.name} (${jobId})`);
       } catch (error) {
         const jobEndTime = new Date();
-        
-        const currentJob = await this.prisma.job.findFirst({
-          where: { bullmqJobId: jobId },
-        });
 
-        if (currentJob && currentJob.retryCount >= queue.maxRetries) {
-          await this.moveToDeadLetter(currentJob, error);
+        const classification = this.errorClassifier.classify(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+
+        console.log(
+          `[Worker ${workerName}] Error classified as ${classification.category}` +
+          ` (matched: ${classification.matchedRule}) for job ${jobId}`,
+        );
+
+        if (classification.category === ErrorCategory.PERMANENT) {
+          const currentJob = await this.prisma.job.findFirst({
+            where: { bullmqJobId: jobId },
+          });
+          if (currentJob) {
+            await this.moveToDeadLetter(currentJob, error);
+          }
           await this.jobService.updateJobStatus(
             jobId,
             JobStatus.FAILED,
-            error instanceof Error ? error.message : String(error),
+            errorMessage,
             jobStartTime,
             jobEndTime,
+          );
+          console.error(
+            `[Worker ${workerName}] Job permanently failed (no retry): ${bullmqJob.name} (${jobId})`,
+            error,
           );
         } else {
-          await this.jobService.updateJobStatus(
-            jobId,
-            JobStatus.FAILED,
-            error instanceof Error ? error.message : String(error),
-            jobStartTime,
-            jobEndTime,
-          );
+          const currentJob = await this.prisma.job.findFirst({
+            where: { bullmqJobId: jobId },
+          });
+
+          const nextAttemptCount = (currentJob?.retryCount || 0) + 1;
+
+          const shouldDeadLetter =
+            this.errorClassifier.isMaxRetriesExceeded(
+              classification.category,
+              nextAttemptCount,
+            ) ||
+            (currentJob && currentJob.retryCount >= queue.maxRetries);
+
+          if (shouldDeadLetter) {
+            if (currentJob) {
+              await this.moveToDeadLetter(currentJob, error);
+            }
+            await this.jobService.updateJobStatus(
+              jobId,
+              JobStatus.FAILED,
+              errorMessage,
+              jobStartTime,
+              jobEndTime,
+            );
+            console.error(
+              `[Worker ${workerName}] Job max retries exceeded, moved to dead-letter: ${bullmqJob.name} (${jobId})`,
+              error,
+            );
+          } else {
+            const delay = this.retryPolicyService.calculateNextDelay(
+              bullmqJob,
+              error,
+              nextAttemptCount,
+            );
+
+            await bullmqJob.moveToDelayed(Date.now() + delay);
+
+            await this.prisma.job.updateMany({
+              where: { bullmqJobId: jobId },
+              data: {
+                status: JobStatus.DELAYED,
+                retryCount: { increment: 1 },
+                failedAt: jobEndTime,
+              },
+            });
+
+            await this.jobService.createJobLog(
+              currentJob?.id || jobId,
+              JobStatus.FAILED,
+              `Retry scheduled with ${classification.category} policy. Next delay: ${delay}ms (attempt ${nextAttemptCount})`,
+              errorMessage,
+              nextAttemptCount,
+              jobStartTime,
+              jobEndTime,
+            );
+
+            console.log(
+              `[Worker ${workerName}] Job retry scheduled: ${bullmqJob.name} (${jobId}),` +
+              ` delay=${delay}ms, attempt=${nextAttemptCount}, category=${classification.category}`,
+            );
+          }
         }
 
-        console.error(`[Worker ${workerName}] Job failed: ${bullmqJob.name} (${jobId})`, error);
         throw error;
       }
     };
