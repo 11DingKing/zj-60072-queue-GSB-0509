@@ -1,10 +1,13 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { BullmqService } from '../bullmq/bullmq.service';
-import { QueueService } from '../queue/queue.service';
-import { JobService } from '../job/job.service';
-import { Worker, Job as BullmqJob } from 'bullmq';
-import { Worker as WorkerModel, JobStatus } from '@prisma/client';
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { PrismaService } from "../prisma/prisma.service";
+import { BullmqService } from "../bullmq/bullmq.service";
+import { QueueService } from "../queue/queue.service";
+import { JobService } from "../job/job.service";
+import { RetryPolicyService } from "../retry-policy/retry-policy.service";
+import { ErrorClassifierService } from "../retry-policy/error-classifier.service";
+import { ErrorClassification } from "../retry-policy/types";
+import { Worker, Job as BullmqJob } from "bullmq";
+import { Worker as WorkerModel, JobStatus } from "@prisma/client";
 
 @Injectable()
 export class WorkerService {
@@ -17,11 +20,13 @@ export class WorkerService {
     private bullmqService: BullmqService,
     private queueService: QueueService,
     private jobService: JobService,
+    private retryPolicyService: RetryPolicyService,
+    private errorClassifierService: ErrorClassifierService,
   ) {}
 
   async registerWorker(queueId: string): Promise<WorkerModel> {
     const queue = await this.queueService.findOne(queueId);
-    
+
     const existingWorker = await this.prisma.worker.findFirst({
       where: { queueId },
     });
@@ -31,15 +36,20 @@ export class WorkerService {
     }
 
     const workerName = `worker-${queue.name}`;
-    
+
     const workerProcessor = async (bullmqJob: BullmqJob) => {
       const jobStartTime = new Date();
       const jobId = bullmqJob.id;
       const queueName = queue.name;
 
-      console.log(`[Worker ${workerName}] Processing job: ${bullmqJob.name} (${jobId})`);
+      console.log(
+        `[Worker ${workerName}] Processing job: ${bullmqJob.name} (${jobId})`,
+      );
 
-      this.processedJobsCount.set(queueId, (this.processedJobsCount.get(queueId) || 0) + 1);
+      this.processedJobsCount.set(
+        queueId,
+        (this.processedJobsCount.get(queueId) || 0) + 1,
+      );
 
       await this.jobService.updateJobStatus(
         jobId,
@@ -60,34 +70,31 @@ export class WorkerService {
           jobEndTime,
         );
 
-        console.log(`[Worker ${workerName}] Job completed: ${bullmqJob.name} (${jobId})`);
+        console.log(
+          `[Worker ${workerName}] Job completed: ${bullmqJob.name} (${jobId})`,
+        );
       } catch (error) {
         const jobEndTime = new Date();
-        
+
         const currentJob = await this.prisma.job.findFirst({
           where: { bullmqJobId: jobId },
         });
 
-        if (currentJob && currentJob.retryCount >= queue.maxRetries) {
-          await this.moveToDeadLetter(currentJob, error);
-          await this.jobService.updateJobStatus(
-            jobId,
-            JobStatus.FAILED,
-            error instanceof Error ? error.message : String(error),
-            jobStartTime,
-            jobEndTime,
-          );
-        } else {
-          await this.jobService.updateJobStatus(
-            jobId,
-            JobStatus.FAILED,
-            error instanceof Error ? error.message : String(error),
+        if (currentJob) {
+          await this.handleJobFailure(
+            bullmqJob,
+            currentJob,
+            error,
+            queue.maxRetries,
             jobStartTime,
             jobEndTime,
           );
         }
 
-        console.error(`[Worker ${workerName}] Job failed: ${bullmqJob.name} (${jobId})`, error);
+        console.error(
+          `[Worker ${workerName}] Job failed: ${bullmqJob.name} (${jobId})`,
+          error,
+        );
         throw error;
       }
     };
@@ -102,7 +109,7 @@ export class WorkerService {
     this.processedJobsCount.set(queueId, 0);
     this.startTime.set(queueId, Date.now());
 
-    bullmqWorker.on('error', (err) => {
+    bullmqWorker.on("error", (err) => {
       console.error(`[Worker ${workerName}] Error:`, err);
     });
 
@@ -110,26 +117,29 @@ export class WorkerService {
       data: {
         queueId: queue.id,
         name: workerName,
-        processorName: 'default',
-        status: 'running',
+        processorName: "default",
+        status: "running",
       },
     });
 
     return worker;
   }
 
-  private async processJob(bullmqJob: BullmqJob, queueName: string): Promise<void> {
+  private async processJob(
+    bullmqJob: BullmqJob,
+    queueName: string,
+  ): Promise<void> {
     const jobData = bullmqJob.data;
     console.log(`Processing job with data:`, jobData);
 
     switch (queueName) {
-      case 'email-queue':
+      case "email-queue":
         await this.simulateEmailJob(jobData);
         break;
-      case 'notification-queue':
+      case "notification-queue":
         await this.simulateNotificationJob(jobData);
         break;
-      case 'report-queue':
+      case "report-queue":
         await this.simulateReportJob(jobData);
         break;
       default:
@@ -140,23 +150,106 @@ export class WorkerService {
   }
 
   private async simulateEmailJob(data: any): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
-    console.log(`Email sent to: ${data.email || 'unknown'}`);
+    await new Promise((resolve) =>
+      setTimeout(resolve, 1000 + Math.random() * 2000),
+    );
+    console.log(`Email sent to: ${data.email || "unknown"}`);
   }
 
   private async simulateNotificationJob(data: any): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
-    console.log(`Notification sent to: ${data.userId || 'unknown'}`);
+    await new Promise((resolve) =>
+      setTimeout(resolve, 500 + Math.random() * 1000),
+    );
+    console.log(`Notification sent to: ${data.userId || "unknown"}`);
   }
 
   private async simulateReportJob(data: any): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 3000));
-    console.log(`Report generated: ${data.reportType || 'unknown'}`);
+    await new Promise((resolve) =>
+      setTimeout(resolve, 2000 + Math.random() * 3000),
+    );
+    console.log(`Report generated: ${data.reportType || "unknown"}`);
   }
 
   private async simulateGenericJob(data: any): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1500));
+    await new Promise((resolve) =>
+      setTimeout(resolve, 500 + Math.random() * 1500),
+    );
     console.log(`Generic job processed`);
+  }
+
+  /**
+   * 处理任务失败
+   * 根据错误分类和重试策略决定是重试还是进入死信队列
+   * @param bullmqJob - BullMQ 任务对象
+   * @param currentJob - 数据库中的任务记录
+   * @param error - 错误对象
+   * @param maxRetries - 最大重试次数
+   * @param jobStartTime - 任务开始时间
+   * @param jobEndTime - 任务结束时间
+   */
+  private async handleJobFailure(
+    bullmqJob: BullmqJob,
+    currentJob: any,
+    error: unknown,
+    maxRetries: number,
+    jobStartTime: Date,
+    jobEndTime: Date,
+  ): Promise<void> {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const attemptCount = currentJob.retryCount + 1;
+
+    const errorClassification = this.errorClassifierService.classify(error);
+
+    if (errorClassification === ErrorClassification.PERMANENT) {
+      await this.moveToDeadLetter(currentJob, error);
+      await this.jobService.updateJobStatus(
+        bullmqJob.id!,
+        JobStatus.FAILED,
+        errorMessage,
+        jobStartTime,
+        jobEndTime,
+      );
+      return;
+    }
+
+    const shouldRetry = this.retryPolicyService.shouldRetry(
+      bullmqJob,
+      error,
+      attemptCount,
+      maxRetries,
+    );
+
+    if (shouldRetry) {
+      const delay = this.retryPolicyService.calculateNextDelay(
+        bullmqJob,
+        error,
+        attemptCount,
+      );
+
+      await this.prisma.job.update({
+        where: { id: currentJob.id },
+        data: { retryCount: attemptCount },
+      });
+
+      await this.jobService.updateJobStatus(
+        bullmqJob.id!,
+        JobStatus.FAILED,
+        `${errorMessage} (retry in ${delay}ms, attempt ${attemptCount})`,
+        jobStartTime,
+        jobEndTime,
+      );
+
+      await bullmqJob.moveToDelayed(Date.now() + delay);
+    } else {
+      await this.moveToDeadLetter(currentJob, error);
+      await this.jobService.updateJobStatus(
+        bullmqJob.id!,
+        JobStatus.FAILED,
+        errorMessage,
+        jobStartTime,
+        jobEndTime,
+      );
+    }
   }
 
   private async moveToDeadLetter(job: any, error: any): Promise<void> {
@@ -175,7 +268,7 @@ export class WorkerService {
   async findAll(): Promise<(WorkerModel & { queue: any })[]> {
     return this.prisma.worker.findMany({
       include: { queue: true },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: "desc" },
     });
   }
 
@@ -194,7 +287,7 @@ export class WorkerService {
 
   async stopWorker(id: string): Promise<WorkerModel> {
     const worker = await this.findOne(id);
-    
+
     const bullmqWorker = this.registeredWorkers.get(worker.queueId);
     if (bullmqWorker) {
       await bullmqWorker.close();
@@ -203,7 +296,7 @@ export class WorkerService {
 
     return this.prisma.worker.update({
       where: { id },
-      data: { status: 'stopped' },
+      data: { status: "stopped" },
     });
   }
 
@@ -214,12 +307,13 @@ export class WorkerService {
     uptime: number;
   }> {
     const worker = await this.findOne(id);
-    
+
     const processedJobs = this.processedJobsCount.get(worker.queueId) || 0;
     const startTime = this.startTime.get(worker.queueId) || Date.now();
     const uptimeMs = Date.now() - startTime;
     const uptimeMinutes = uptimeMs / 60000;
-    const processingRate = uptimeMinutes > 0 ? processedJobs / uptimeMinutes : 0;
+    const processingRate =
+      uptimeMinutes > 0 ? processedJobs / uptimeMinutes : 0;
 
     return {
       worker,
@@ -235,7 +329,7 @@ export class WorkerService {
     averageRate: number;
   }> {
     const workers = await this.findAll();
-    
+
     let totalProcessed = 0;
     let totalRate = 0;
     let activeWorkers = 0;
@@ -245,7 +339,7 @@ export class WorkerService {
       totalProcessed += processed;
 
       const startTime = this.startTime.get(worker.queueId);
-      if (startTime && worker.status === 'running') {
+      if (startTime && worker.status === "running") {
         const uptimeMinutes = (Date.now() - startTime) / 60000;
         if (uptimeMinutes > 0) {
           totalRate += processed / uptimeMinutes;
@@ -257,7 +351,10 @@ export class WorkerService {
     return {
       workers,
       totalProcessed,
-      averageRate: activeWorkers > 0 ? Math.round((totalRate / activeWorkers) * 100) / 100 : 0,
+      averageRate:
+        activeWorkers > 0
+          ? Math.round((totalRate / activeWorkers) * 100) / 100
+          : 0,
     };
   }
 }
